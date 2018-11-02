@@ -3,16 +3,11 @@ import numpy as np
 from .activations import NoActivation
 from .constants import EPSILON
 from .initializers import Constant
-
-"""
-Batch norm backprop
-https://kratzert.github.io/2016/02/12/understanding-the-gradient-flow-through-the-batch-normalization-layer.html
-"""
-
+from .optimizers import Momentum
 
 class Layer(ABC):
     @abstractmethod
-    def init_weights(self, num_input, optimizer):
+    def init_weights(self, num_input, optimizer, initializer):
         pass
 
     @abstractmethod
@@ -25,60 +20,69 @@ class Layer(ABC):
 
 
 class BatchNorm(Layer):
+    """
+    I don't know why batch norm does worse than normal layer
+    Batch norm backprop
+    https://kratzert.github.io/2016/02/12/understanding-the-gradient-flow-through-the-batch-normalization-layer.html
+    """
     def init_weights(self, num_output, optimizer, initializer):
         self._batch_norm_G = initializer(1, num_output)
         self._batch_norm_B = initializer(1, num_output)
         # init optimizer
         self._optimizer_G = optimizer.generate_optimizer((1, num_output))
         self._optimizer_B = optimizer.generate_optimizer((1, num_output))
+        self._optimizer_mean = Momentum().generate_optimizer((1, num_output)) #optimizer.generate_optimizer((1, num_output))
 
     def feed_forward(self, z):
-        self.diff_mean = z-np.mean(z, axis=0)
-        variance = np.mean(np.square(self.diff_mean), axis=0)
+        mean = np.mean(z, axis=0)
+        mean = self._optimizer_mean.get_velocity(mean)
+
+        self._diff_mean = z-mean
+        variance = np.mean(np.square(self._diff_mean), axis=0)
 
         self._one_over_stddev = 1/np.sqrt(variance + EPSILON)
-        self._z_norm = self.diff_mean * self._one_over_stddev
-        self._z_hat = self._batch_norm_G * self._z_norm + self._batch_norm_B
-        return self._z_hat
+        self._z_norm = self._diff_mean * self._one_over_stddev
+        self._output = self._batch_norm_G * self._z_norm + self._batch_norm_B
+        return self._output
 
-    def back_prop(self, dz_hat, output, learning_rate):
-        dG = np.sum(self._z_norm * dz_hat, axis=0)
-        dB = np.sum(dz_hat, axis=0)
+    def back_prop(self, last_derivative, learning_rate):
+        dG = np.sum(self._z_norm * last_derivative, axis=0)
+        dB = np.sum(last_derivative, axis=0)
         self._batch_norm_G -= learning_rate * self._optimizer_G.get_velocity(dG)
         self._batch_norm_B -= learning_rate * self._optimizer_G.get_velocity(dB)
 
-        dz_norm = self._batch_norm_G * dz_hat
+        dz_norm = self._batch_norm_G * last_derivative
 
         # ---- d_z_minus_u_1 ----
         d_z_minus_u_1 = self._one_over_stddev * dz_norm
         # -----------------------
         d_stddev = -np.square(self._one_over_stddev) * \
-            np.sum(self.diff_mean * dz_norm, axis=0)
+            np.sum(self._diff_mean * dz_norm, axis=0)
         d_variance = 0.5 * self._one_over_stddev * d_stddev
         d_z_minus_u_square = np.full(
-            output.shape, 1/output.shape[0]) * d_variance
+            self._output.shape, 1/self._output.shape[0]) * d_variance
 
         # ---- d_z_minus_u_2 ----
-        d_z_minus_u_2 = 2 * self.diff_mean * d_z_minus_u_square
+        d_z_minus_u_2 = 2 * self._diff_mean * d_z_minus_u_square
         # -----------------------
         d_z_minus_u = d_z_minus_u_1 + d_z_minus_u_2
         dz_1 = 1 * d_z_minus_u
         du = -np.sum(d_z_minus_u, axis=0)
 
-        dz_2 = np.full(output.shape, 1/output.shape[0]) * du
+        dz_2 = np.full(self._output.shape, 1/self._output.shape[0]) * du
 
         dz = dz_1 + dz_2
         return dz
 
 
 class Dense(Layer):
-    def __init__(self, num_output, Activation_function=None):
+    def __init__(self, num_output, Activation_function=None, is_batch_norm=False):
         self._num_output = num_output
         self._activation_function = Activation_function(
         ) if Activation_function is not None else NoActivation()
+        self._is_batch_norm = is_batch_norm
 
     def init_weights(self, num_input, optimizer, initializer):
-        self._num_input = num_input
         # init weights
         self._weights = initializer(num_input, self._num_output)
         self._bias = initializer(1, self._num_output)
@@ -86,12 +90,15 @@ class Dense(Layer):
         self._optimizer_w = optimizer.generate_optimizer(self._weights.shape)
         self._optimizer_b = optimizer.generate_optimizer(self._bias.shape)
         # batch_norm
-        self.batch_norm = BatchNorm()
-        self.batch_norm.init_weights(self._num_output, optimizer, initializer)
+        if self._is_batch_norm:
+            self.batch_norm = BatchNorm()
+            self.batch_norm.init_weights(self._num_output, optimizer, initializer)
 
     def feed_forward(self, input):
         z = np.dot(input, self._weights) + self._bias
-        z = self.batch_norm.feed_forward(z)
+
+        if self._is_batch_norm:
+            z = self.batch_norm.feed_forward(z)
 
         # output & save
         output = self._activation_function.feed_forward(z)
@@ -102,7 +109,8 @@ class Dense(Layer):
     def back_prop(self, last_derivative, learning_rate):
         dz = last_derivative * self._activation_function.back_prop()
 
-        dz = self.batch_norm.back_prop(dz, self._output, learning_rate)
+        if self._is_batch_norm:
+            dz = self.batch_norm.back_prop(dz, learning_rate)
 
         # Update weight
         # Be careful, it's not mean, it's sum
